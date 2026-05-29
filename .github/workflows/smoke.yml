@@ -24,7 +24,11 @@ jobs:
           - { rid: win-arm64,   os: windows-11-arm,   exe: NeoWalletProof.exe }
           - { rid: linux-x64,   os: ubuntu-latest,    exe: NeoWalletProof }
           - { rid: linux-arm64, os: ubuntu-24.04-arm, exe: NeoWalletProof }
-          - { rid: osx-x64,     os: macos-13,         exe: NeoWalletProof }
+          # macos-13 was retired on 2025-12-04. macos-15-intel is the
+          # standard-runner replacement for x86_64 and is supported until
+          # August 2027 (Apple's Intel architecture will be dropped from
+          # GitHub Actions entirely after that).
+          - { rid: osx-x64,     os: macos-15-intel,   exe: NeoWalletProof }
           - { rid: osx-arm64,   os: macos-latest,     exe: NeoWalletProof }
 
     steps:
