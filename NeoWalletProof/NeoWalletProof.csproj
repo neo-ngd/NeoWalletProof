@@ -5,7 +5,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>NeoWalletProof</RootNamespace>
     <AssemblyName>NeoWalletProof</AssemblyName>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Description>Neo legacy wallet ownership proof (Neo 2.13.0)</Description>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
