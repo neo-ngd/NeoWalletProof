@@ -18,8 +18,6 @@ internal static class CliRunner
             {
                 "prove" => RunProve(ParseOptions(args)),
                 "verify" => RunVerify(ParseOptions(args)),
-                "sign" => RunSign(ParseOptions(args)),
-                "verify-sign" => RunVerifySign(ParseOptions(args)),
                 "help" or "--help" or "-h" => PrintHelp(),
                 _ => Unknown(args[0])
             };
@@ -33,24 +31,57 @@ internal static class CliRunner
 
     private static int RunProve(Dictionary<string, string?> opt)
     {
-        var walletPath = Require(opt, "wallet", "w");
-        var password = Require(opt, "password", "p");
-        var address = Require(opt, "address", "a");
-        var challenge = Require(opt, "challenge", "c");
+        using var wallet = OpenWalletFromOpt(opt);
 
-        using var wallet = WalletOpener.Open(walletPath, password);
-        var account = wallet.GetAccounts().FirstOrDefault(a => a.HasKey && a.Address == address);
-        if (account == null)
-            throw new InvalidOperationException("Address not found or not signable in wallet.");
-
-        var proof = WalletProofPayload.Create(address, challenge, account.GetKey());
-        var outFile = opt.GetValueOrDefault("out") ?? opt.GetValueOrDefault("o");
-        var json = proof.ToJson();
-        if (!string.IsNullOrEmpty(outFile))
-            File.WriteAllText(outFile, json);
+        // Multi-sig continuation: -k / --continue carries a partial context (file or JSON).
+        var contextArg = opt.GetValueOrDefault("continue") ?? opt.GetValueOrDefault("k");
+        ProveOutcome outcome;
+        if (!string.IsNullOrEmpty(contextArg))
+        {
+            var json = File.Exists(contextArg) ? File.ReadAllText(contextArg) : contextArg;
+            outcome = ProveService.Continue(wallet, json);
+        }
         else
-            Console.WriteLine(json);
+        {
+            var challenge = Require(opt, "challenge", "c");
+            var address = ResolveStartAddress(wallet, opt);
+            outcome = ProveService.Start(wallet, address, challenge);
+        }
+
+        EmitProveOutcome(outcome, opt);
         return 0;
+    }
+
+    private static string ResolveStartAddress(Wallet wallet, Dictionary<string, string?> opt)
+    {
+        var requested = opt.GetValueOrDefault("address") ?? opt.GetValueOrDefault("a");
+        if (!string.IsNullOrEmpty(requested))
+            return requested;
+
+        var signable = wallet.GetAccounts().Where(a => a.HasKey && !a.WatchOnly).ToList();
+        if (signable.Count == 0)
+            throw new InvalidOperationException("No signable accounts in wallet.");
+        if (signable.Count > 1)
+            throw new ArgumentException("Wallet has multiple accounts; specify --address (-a).");
+        return signable[0].Address;
+    }
+
+    private static void EmitProveOutcome(ProveOutcome outcome, Dictionary<string, string?> opt)
+    {
+        var outFile = opt.GetValueOrDefault("out") ?? opt.GetValueOrDefault("o");
+        if (!string.IsNullOrEmpty(outFile))
+            File.WriteAllText(outFile, outcome.Json);
+        else
+            Console.WriteLine(outcome.Json);
+
+        if (outcome.IsMultiSig)
+        {
+            var status = outcome.IsComplete
+                ? $"complete ({outcome.SignaturesPresent}/{outcome.SignaturesRequired})"
+                : $"partial — {outcome.SignaturesPresent}/{outcome.SignaturesRequired} signatures, " +
+                  $"{outcome.SignaturesRequired - outcome.SignaturesPresent} more needed";
+            Console.Error.WriteLine($"# multi-sig proof {status}; signed as {outcome.SignerPublicKey}");
+        }
     }
 
     private static int RunVerify(Dictionary<string, string?> opt)
@@ -62,55 +93,41 @@ internal static class CliRunner
             throw new ArgumentException("Provide --file or --json.");
 
         var json = File.Exists(input) ? File.ReadAllText(input) : input;
-        var proof = WalletProofPayload.FromJson(json);
-        if (WalletProofVerifier.TryVerify(proof, out var error))
+        if (WalletProofVerifier.TryVerify(
+                json, out var error, out var address, out var challenge,
+                out var present, out var required))
         {
             Console.WriteLine("VALID");
-            Console.WriteLine($"address={proof.Address}");
-            Console.WriteLine($"challenge={proof.Challenge}");
+            Console.WriteLine($"address={address}");
+            Console.WriteLine($"challenge={challenge}");
+            if (required > 1)
+                Console.WriteLine($"signatures={present}/{required}");
             return 0;
         }
         Console.Error.WriteLine(error);
         return 2;
     }
 
-    private static int RunSign(Dictionary<string, string?> opt)
+    /// <summary>
+    /// Open a wallet from <c>--wallet</c>/<c>-w</c>, accepting a wallet file path or a
+    /// raw private key (WIF / NEP-2 / hex). <c>--password</c>/<c>-p</c> is required for
+    /// file wallets and NEP-2 keys; ignored for WIF and hex.
+    /// </summary>
+    private static Wallet OpenWalletFromOpt(Dictionary<string, string?> opt)
     {
-        var walletPath = Require(opt, "wallet", "w");
-        var password = Require(opt, "password", "p");
-        var json = opt.GetValueOrDefault("json") ?? opt.GetValueOrDefault("j");
-        if (string.IsNullOrEmpty(json))
+        var walletInput = Require(opt, "wallet", "w");
+        var password = opt.GetValueOrDefault("password") ?? opt.GetValueOrDefault("p");
+        var kind = WalletOpener.DetectKind(walletInput);
+        return kind switch
         {
-            var file = Require(opt, "file", "f");
-            json = File.ReadAllText(file);
-        }
-
-        using var wallet = WalletOpener.Open(walletPath, password);
-        var output = ContractContextService.SignContext(wallet, json);
-        var outFile = opt.GetValueOrDefault("out") ?? opt.GetValueOrDefault("o");
-        if (!string.IsNullOrEmpty(outFile))
-            File.WriteAllText(outFile, output);
-        else
-            Console.WriteLine(output);
-        return 0;
-    }
-
-    private static int RunVerifySign(Dictionary<string, string?> opt)
-    {
-        var input = opt.GetValueOrDefault("file") ?? opt.GetValueOrDefault("f");
-        if (string.IsNullOrEmpty(input) && opt.TryGetValue("json", out var j))
-            input = j;
-        if (string.IsNullOrEmpty(input))
-            throw new ArgumentException("Provide --file or --json.");
-
-        var json = File.Exists(input) ? File.ReadAllText(input) : input;
-        if (ContractContextService.TryVerifySignedContext(json, out var error))
-        {
-            Console.WriteLine("VALID");
-            return 0;
-        }
-        Console.Error.WriteLine(error);
-        return 2;
+            WalletInputKind.File => string.IsNullOrEmpty(password)
+                ? throw new ArgumentException("Missing --password (-p) for wallet file.")
+                : WalletOpener.Open(walletInput, password),
+            WalletInputKind.Nep2 => string.IsNullOrEmpty(password)
+                ? throw new ArgumentException("Missing --password (-p) for NEP-2 private key.")
+                : WalletOpener.OpenFromKey(walletInput, password),
+            _ => WalletOpener.OpenFromKey(walletInput),
+        };
     }
 
     private static string Require(Dictionary<string, string?> opt, string longName, string shortName)
@@ -169,10 +186,22 @@ internal static class CliRunner
 Interactive:  NeoWalletProof
 
 CLI:
-  NeoWalletProof prove -w <wallet> -p <pass> -a <address> -c <challenge> [-o out.json]
-  NeoWalletProof verify -f <proof.json>
-  NeoWalletProof sign -w <wallet> -p <pass> -f <context.json> [-o out.json]
-  NeoWalletProof verify-sign -f <signed.json>
+  Start a proof (single- or multi-sig):
+    NeoWalletProof prove -w <wallet|WIF|NEP-2|hex> [-p <pass>] [-a <address>] -c <challenge> [-o out.json]
+  Continue an in-flight multi-sig proof (add my signature):
+    NeoWalletProof prove -w <wallet|WIF|NEP-2|hex> [-p <pass>] -k <context.json|inline-json> [-o out.json]
+  Verify any proof JSON (single- or multi-sig):
+    NeoWalletProof verify -f <proof.json>
+
+-w / --wallet accepts any of:
+  - NEP-6 wallet file (*.json)            : -p required
+  - SQLite wallet file (*.db3)            : -p required
+  - NEP-2 encrypted private key (6P...)   : -p required
+  - WIF private key (K... / L... / 5...)  : -p ignored
+  - Hex private key (64 hex chars)        : -p ignored
+
+-a / --address may be omitted when the wallet contains a single signable account
+(typical for WIF / NEP-2 / hex imports).
 
 Place protocol.json / config.json next to the executable (same as neo-cli).
 ");
