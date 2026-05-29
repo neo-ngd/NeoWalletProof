@@ -1,0 +1,124 @@
+name: smoke
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  smoke:
+    name: ${{ matrix.rid }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x86,     os: windows-latest,   exe: NeoWalletProof.exe }
+          - { rid: win-x64,     os: windows-latest,   exe: NeoWalletProof.exe }
+          - { rid: win-arm64,   os: windows-11-arm,   exe: NeoWalletProof.exe }
+          - { rid: linux-x64,   os: ubuntu-latest,    exe: NeoWalletProof }
+          - { rid: linux-arm64, os: ubuntu-24.04-arm, exe: NeoWalletProof }
+          - { rid: osx-x64,     os: macos-13,         exe: NeoWalletProof }
+          - { rid: osx-arm64,   os: macos-latest,     exe: NeoWalletProof }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Show toolchain
+        run: |
+          dotnet --info
+          Write-Host "Runner arch : $env:RUNNER_ARCH"
+          Write-Host "Runner OS   : $env:RUNNER_OS"
+
+      - name: Restore
+        run: dotnet restore ./NeoWalletProof/NeoWalletProof.csproj
+
+      - name: Build (Release, no run)
+        run: dotnet build ./NeoWalletProof/NeoWalletProof.csproj -c Release --no-restore --nologo
+
+      - name: Publish ${{ matrix.rid }} (self-contained, single-file)
+        run: |
+          dotnet publish ./NeoWalletProof/NeoWalletProof.csproj `
+            -c Release `
+            -r ${{ matrix.rid }} `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=embedded `
+            -o ./publish/${{ matrix.rid }} `
+            --nologo
+
+      - name: List publish output
+        run: Get-ChildItem ./publish/${{ matrix.rid }} | Format-Table Name, Length
+
+      - name: Mark binary executable (non-Windows)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: chmod +x "./publish/${{ matrix.rid }}/${{ matrix.exe }}"
+
+      - name: Smoke test — start the shell and expect 'proof>' prompt
+        run: |
+          $bin = Join-Path "./publish/${{ matrix.rid }}" "${{ matrix.exe }}"
+          if (-not (Test-Path $bin)) { throw "binary not found: $bin" }
+          $binFull = (Resolve-Path $bin).Path
+          $workDir = (Resolve-Path "./publish/${{ matrix.rid }}").Path
+          Write-Host "Launching: $binFull"
+
+          $psi = [System.Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName               = $binFull
+          $psi.WorkingDirectory       = $workDir
+          $psi.UseShellExecute         = $false
+          $psi.RedirectStandardInput   = $true
+          $psi.RedirectStandardOutput  = $true
+          $psi.RedirectStandardError   = $true
+          $psi.StandardInputEncoding   = [System.Text.UTF8Encoding]::new($false)
+          $psi.StandardOutputEncoding  = [System.Text.Encoding]::UTF8
+          $psi.StandardErrorEncoding   = [System.Text.Encoding]::UTF8
+
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $proc.StandardInput.WriteLine('exit')
+          $proc.StandardInput.Close()
+
+          if (-not $proc.WaitForExit(60000)) {
+            try { $proc.Kill($true) } catch {}
+            throw "process did not exit within 60s"
+          }
+
+          $stdout = $proc.StandardOutput.ReadToEnd()
+          $stderr = $proc.StandardError.ReadToEnd()
+
+          Write-Host '----- stdout -----'
+          Write-Host $stdout
+          if ($stderr) {
+            Write-Host '----- stderr -----'
+            Write-Host $stderr
+          }
+          Write-Host "----- exit: $($proc.ExitCode) -----"
+
+          if ($proc.ExitCode -ne 0) {
+            throw "non-zero exit code from ${{ matrix.rid }} binary: $($proc.ExitCode)"
+          }
+          if ($stdout -notmatch 'proof>') {
+            throw "expected 'proof>' prompt not found in stdout for ${{ matrix.rid }}"
+          }
+
+          Write-Host "OK: 'proof>' prompt detected on ${{ matrix.rid }}"
+
+      - name: Upload publish folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeoWalletProof-${{ matrix.rid }}
+          path: ./publish/${{ matrix.rid }}/
+          if-no-files-found: error
+          retention-days: 14
